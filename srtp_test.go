@@ -153,6 +153,31 @@ func TestRolloverCountOverflow(t *testing.T) {
 	assert.True(t, ovf, "Should overflow")
 }
 
+func TestRolloverCountRemoteROCMonotonic(t *testing.T) {
+	ssrcState := &srtpSSRCState{ssrc: defaultSsrc}
+
+	// The first RCC packet synchronizes the local index to the remote ROC.
+	ssrcState.updateRolloverCount(100, 0, true, 3)
+	assert.Equal(t, uint64(3)<<16|100, ssrcState.index)
+
+	// A newer remote ROC advances the local index.
+	ssrcState.updateRolloverCount(5, 0, true, 4)
+	assert.Equal(t, uint64(4)<<16|5, ssrcState.index)
+
+	// An RCC packet carrying an older ROC must not roll the index back.
+	ssrcState.updateRolloverCount(0xFFFF, 0, true, 3)
+	assert.Equal(t, uint64(4)<<16|5, ssrcState.index)
+
+	// A reordered RCC packet from the current ROC must not roll the index back either.
+	ssrcState.updateRolloverCount(2, 0, true, 4)
+	assert.Equal(t, uint64(4)<<16|5, ssrcState.index)
+
+	// ROC guessing for packets without ROC still works after rejected rollbacks.
+	roc, _, ovf := ssrcState.nextRolloverCount(10)
+	assert.Equal(t, uint32(4), roc)
+	assert.False(t, ovf, "Should not overflow")
+}
+
 func buildTestContext(profile ProtectionProfile, opts ...ContextOption) (*Context, error) {
 	keyLen, err := profile.KeyLen()
 	if err != nil {

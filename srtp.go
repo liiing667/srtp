@@ -56,9 +56,11 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 		index = (uint64(roc) << 16) | uint64(header.SequenceNumber)
 	} else {
 		// Extract ROC from the packet. The ROC is sent in the first 4 bytes of the auth tag.
+		// It is authenticated, but the packet may be old or replayed, so the local
+		// index is only advanced (never rolled back) by updateRolloverCount below,
+		// and only after the auth tag has been verified.
 		roc = binary.BigEndian.Uint32(ciphertext[len(ciphertext)-authTagLen:])
 		index = (uint64(roc) << 16) | uint64(header.SequenceNumber)
-		diff = int64(ssrcState.index) - int64(index) //nolint:gosec
 	}
 
 	// The replay check is intentionally performed before authentication.

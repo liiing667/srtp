@@ -15,6 +15,103 @@ import (
 
 // Tests for Roll-over Counter Carrying Transform from RFC 4771
 
+// An authenticated but old RCC packet (reordered or replayed) must not roll the
+// local ROC/index back. Rolling back would retreat the replay window and allow
+// already-seen packets to be accepted again.
+func TestRCCOldROCDoesNotRollBackState(t *testing.T) {
+	const (
+		SSRC            = uint32(0xcafebabe)
+		ROCTransmitRate = uint16(10)
+		replayWindow    = 64
+	)
+
+	profiles := map[string]ProtectionProfile{
+		"AES-CM":  ProtectionProfileAes128CmHmacSha1_80,
+		"AES-GCM": ProtectionProfileAeadAes128Gcm,
+	}
+
+	for name, profile := range profiles {
+		t.Run(name, func(t *testing.T) {
+			keyLen, err := profile.KeyLen()
+			assert.NoError(t, err)
+			saltLen, err := profile.SaltLen()
+			assert.NoError(t, err)
+
+			masterKey := make([]byte, keyLen)
+			masterSalt := make([]byte, saltLen)
+
+			rccMode := RCCMode2
+			if aeadLen, errLen := profile.AEADAuthTagLen(); errLen == nil && aeadLen != 0 {
+				rccMode = RCCMode3
+			}
+
+			ctxEnc, err := CreateContext(masterKey, masterSalt, profile,
+				RolloverCounterCarryingTransform(rccMode, ROCTransmitRate))
+			assert.NoError(t, err)
+			ctxEnc.SetROC(SSRC, 1)
+
+			ctxDec, err := CreateContext(masterKey, masterSalt, profile,
+				RolloverCounterCarryingTransform(rccMode, ROCTransmitRate),
+				SRTPReplayProtection(replayWindow))
+			assert.NoError(t, err)
+
+			encrypt := func(seq uint16) []byte {
+				pkt := &rtp.Packet{
+					Header:  rtp.Header{Version: 2, SSRC: SSRC, SequenceNumber: seq},
+					Payload: []byte{0xab, 0xab, 0xab, 0xab},
+				}
+				raw, errMarshal := pkt.Marshal()
+				assert.NoError(t, errMarshal)
+				enc, errEnc := ctxEnc.EncryptRTP(nil, raw, nil)
+				assert.NoError(t, errEnc)
+
+				return enc
+			}
+			decrypt := func(pkt []byte) error {
+				_, errDec := ctxDec.DecryptRTP(nil, pkt, nil)
+
+				return errDec
+			}
+
+			// ROC 1: deliver seq 65520 (carries ROC), hold seq 65530 (also carries ROC).
+			assert.NoError(t, decrypt(encrypt(65520)))
+			oldROCPacket := encrypt(65530)
+
+			// Rollover to ROC 2: deliver seq 0 (carries ROC) up to seq 10.
+			var seq5Packet []byte
+			for seq := uint16(0); seq <= 10; seq++ {
+				pkt := encrypt(seq)
+				if seq == 5 {
+					seq5Packet = pkt
+				}
+				assert.NoError(t, decrypt(pkt))
+			}
+			roc, ok := ctxDec.ROC(SSRC)
+			assert.True(t, ok)
+			assert.Equal(t, uint32(2), roc)
+
+			// A delayed ROC-1 packet is still within the replay window and
+			// authenticates, but it must not roll the local ROC back.
+			assert.NoError(t, decrypt(oldROCPacket))
+			roc, ok = ctxDec.ROC(SSRC)
+			assert.True(t, ok)
+			assert.Equal(t, uint32(2), roc, "old RCC packet must not roll back the local ROC")
+
+			// Replaying it again must be rejected as a duplicate.
+			assert.ErrorIs(t, decrypt(oldROCPacket), errDuplicated)
+
+			// Replaying an already-seen ROC-2 packet must still be rejected.
+			assert.ErrorIs(t, decrypt(seq5Packet), errDuplicated)
+
+			// Normal traffic after the old packet still decrypts.
+			assert.NoError(t, decrypt(encrypt(11)))
+			roc, ok = ctxDec.ROC(SSRC)
+			assert.True(t, ok)
+			assert.Equal(t, uint32(2), roc)
+		})
+	}
+}
+
 // nolint:cyclop,maintidx
 func TestRCC(t *testing.T) {
 	const (

@@ -329,8 +329,14 @@ func (s *srtpSSRCState) updateRolloverCount(sequenceNumber uint16, difference in
 ) {
 	switch {
 	case hasRemoteRoc:
-		s.index = (uint64(remoteRoc) << 16) | uint64(sequenceNumber)
-		s.rolloverHasProcessed = true
+		// The ROC carried by an RCC packet is authenticated, but the packet itself
+		// may be old (reordered or replayed). Never move the local index backwards:
+		// rolling the index back would retreat the replay window and allow
+		// already-seen packets to be accepted again.
+		if index := (uint64(remoteRoc) << 16) | uint64(sequenceNumber); index > s.index {
+			s.index = index
+			s.rolloverHasProcessed = true
+		}
 	case !s.rolloverHasProcessed:
 		s.index |= uint64(sequenceNumber)
 		s.rolloverHasProcessed = true
