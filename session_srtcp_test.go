@@ -15,6 +15,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const rtcpHeaderSize = 4
@@ -25,6 +26,11 @@ func TestSessionSRTCPBadInit(t *testing.T) {
 
 	_, err = NewSessionSRTCP(nil, &Config{})
 	assert.Error(t, err, "NewSessionSRTCP should error if no net was provided")
+
+	pipeA, pipeB := net.Pipe()
+	defer func() { _ = pipeA.Close(); _ = pipeB.Close() }()
+	_, err = NewSessionSRTCP(pipeA, &Config{MaxReadStreams: -1})
+	assert.ErrorIs(t, err, errInvalidMaxReadStreams)
 }
 
 func buildSessionSRTCP(t *testing.T) (*SessionSRTCP, net.Conn, *Config) { //nolint:dupl
@@ -932,4 +938,165 @@ func errIsTimeout(err error) bool {
 	}
 
 	return false
+}
+
+// buildLimitedSessionSRTCPPair builds an SRTCP session pair whose receiver rejects
+// more than maxStreams concurrently registered per-SSRC read streams.
+func buildLimitedSessionSRTCPPair(t *testing.T, maxStreams int) (*SessionSRTCP, *SessionSRTCP) {
+	t.Helper()
+
+	aPipe, bPipe := net.Pipe()
+	config := &Config{
+		Profile:        ProtectionProfileAes128CmHmacSha1_80,
+		MaxReadStreams: maxStreams,
+		Keys: SessionKeys{
+			[]byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39},
+			[]byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6},
+			[]byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39},
+			[]byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6},
+		},
+	}
+
+	aSession, err := NewSessionSRTCP(aPipe, config)
+	require.NoError(t, err)
+	bSession, err := NewSessionSRTCP(bPipe, config)
+	require.NoError(t, err)
+
+	return aSession, bSession
+}
+
+func TestSessionSRTCPMaxReadStreamsOpenReadStream(t *testing.T) {
+	lim := test.TimeOut(5 * time.Second)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	sender, receiver := buildLimitedSessionSRTCPPair(t, 2)
+	defer func() {
+		assert.NoError(t, sender.Close())
+		assert.NoError(t, receiver.Close())
+	}()
+
+	first, err := receiver.OpenReadStream(5000)
+	require.NoError(t, err)
+	second, err := receiver.OpenReadStream(5001)
+	require.NoError(t, err)
+
+	_, err = receiver.OpenReadStream(5002)
+	assert.ErrorIs(t, err, ErrMaxReadStreamsExceeded)
+
+	require.NoError(t, first.Close())
+	third, err := receiver.OpenReadStream(5002)
+	require.NoError(t, err)
+	require.NoError(t, third.Close())
+	require.NoError(t, second.Close())
+
+	receiver.session.readStreamsLock.Lock()
+	streamCount := len(receiver.session.readStreams)
+	receiver.session.readStreamsLock.Unlock()
+	assert.Zero(t, streamCount)
+}
+
+func TestSessionSRTCPMaxReadStreamsRejectsRemoteSSRC(t *testing.T) {
+	lim := test.TimeOut(5 * time.Second)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	sender, receiver := buildLimitedSessionSRTCPPair(t, 1)
+	defer func() {
+		assert.NoError(t, sender.Close())
+		assert.NoError(t, receiver.Close())
+	}()
+
+	goodPacket, err := encryptSRTCP(
+		sender.session.localContext, &rtcp.PictureLossIndication{MediaSSRC: 5000},
+	)
+	require.NoError(t, err)
+	_, err = sender.session.nextConn.Write(goodPacket)
+	require.NoError(t, err)
+
+	accepted, ssrc, err := receiver.AcceptStream()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(5000), ssrc)
+
+	// Authenticated RTCP for a second SSRC must be rejected deterministically and
+	// must not create stream state; the read loop keeps servicing good packets.
+	rejectedPacket, err := encryptSRTCP(
+		sender.session.localContext, &rtcp.PictureLossIndication{MediaSSRC: 5001},
+	)
+	require.NoError(t, err)
+	_, err = sender.session.nextConn.Write(rejectedPacket)
+	require.NoError(t, err)
+
+	goodPLI, err := rtcp.Marshal([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: 5000}})
+	require.NoError(t, err)
+	_, err = sender.session.nextConn.Write(goodPacket)
+	require.NoError(t, err)
+
+	readBuffer := make([]byte, len(goodPLI))
+	n, readErr := accepted.Read(readBuffer)
+	require.NoError(t, readErr)
+	assert.Equal(t, goodPLI, readBuffer[:n])
+
+	receiver.session.readStreamsLock.Lock()
+	streamCount := len(receiver.session.readStreams)
+	_, hasRejectedSSRC := receiver.session.readStreams[5001]
+	receiver.session.readStreamsLock.Unlock()
+	assert.Equal(t, 1, streamCount)
+	assert.False(t, hasRejectedSSRC)
+
+	require.NoError(t, accepted.Close())
+}
+
+func TestSessionSRTCPCloseWithPendingAcceptedStreams(t *testing.T) {
+	lim := test.TimeOut(5 * time.Second)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// The read loop registers the first stream and then blocks on the unbuffered
+	// newStream notification because nobody calls AcceptStream.
+	sender, receiver := buildLimitedSessionSRTCPPair(t, 2)
+
+	// net.Pipe writes rendezvous with the read loop, so write from a goroutine;
+	// the second write stays pending while the read loop is blocked on the
+	// unaccepted newStream notification, which is the condition Close must end.
+	go func() {
+		for _, ssrc := range []uint32{5000, 5001} {
+			encrypted, err := encryptSRTCP(
+				sender.session.localContext, &rtcp.PictureLossIndication{MediaSSRC: ssrc},
+			)
+			assert.NoError(t, err)
+			_, err = sender.session.nextConn.Write(encrypted)
+			assert.True(t, err == nil || strings.Contains(err.Error(), "closed"))
+		}
+	}()
+	// The first packet's stream is published before the second write blocks the
+	// read loop on the unbuffered newStream notification; the first stream stays
+	// registered in the map while the loop is blocked.
+	require.Eventually(t, func() bool {
+		receiver.session.readStreamsLock.Lock()
+		defer receiver.session.readStreamsLock.Unlock()
+
+		return len(receiver.session.readStreams) == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- receiver.Close()
+	}()
+	select {
+	case closeErr := <-done:
+		assert.NoError(t, closeErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("receiver Close blocked while unaccepted streams were pending")
+	}
+
+	assert.NoError(t, sender.Close())
+	_, _, err := receiver.AcceptStream()
+	assert.ErrorIs(t, err, errStreamAlreadyClosed)
 }

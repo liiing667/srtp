@@ -43,6 +43,8 @@ func NewSessionSRTCP(conn net.Conn, config *Config) (*SessionSRTCP, error) { //n
 		return nil, errNoConfig
 	} else if conn == nil {
 		return nil, errNoConn
+	} else if config.MaxReadStreams < 0 {
+		return nil, errInvalidMaxReadStreams
 	}
 
 	loggerFactory := config.LoggerFactory
@@ -69,10 +71,12 @@ func NewSessionSRTCP(conn net.Conn, config *Config) (*SessionSRTCP, error) { //n
 			remoteOptions:       remoteOpts,
 			readStreams:         map[uint32]readStream{},
 			newStream:           make(chan readStream),
+			closing:             make(chan any),
 			acceptStreamTimeout: config.AcceptStreamTimeout,
 			started:             make(chan any),
 			closed:              make(chan any),
 			bufferFactory:       config.BufferFactory,
+			maxReadStreams:      config.MaxReadStreams,
 			log:                 loggerFactory.NewLogger("srtp"),
 		},
 	}
@@ -99,7 +103,10 @@ func (s *SessionSRTCP) OpenWriteStream() (*WriteStreamSRTCP, error) {
 // OpenReadStream opens a read stream for the given SSRC, it can be used
 // if you want a certain SSRC, but don't want to wait for AcceptStream.
 func (s *SessionSRTCP) OpenReadStream(ssrc uint32) (*ReadStreamSRTCP, error) {
-	r, _ := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTCP)
+	r, _, err := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTCP)
+	if err != nil {
+		return nil, err
+	}
 
 	if readStream, ok := r.(*ReadStreamSRTCP); ok {
 		return readStream, nil
@@ -235,14 +242,25 @@ func (s *SessionSRTCP) decrypt(buf []byte, attrs packetio.Attributes) error {
 		}
 
 		for _, ssrc := range destinations {
-			r, isNew := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTCP)
+			r, isNew, streamErr := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTCP)
+			if streamErr != nil {
+				// Deterministically reject (and log) packets that would exceed the
+				// configured stream budget; keep processing the rest of the compound.
+				parseErrs = errors.Join(parseErrs, streamErr)
+
+				continue
+			}
 			if r == nil {
 				return nil // Session has been closed
 			} else if isNew {
 				if !s.session.acceptStreamTimeout.IsZero() {
 					_ = s.session.nextConn.SetReadDeadline(time.Time{})
 				}
-				s.session.newStream <- r // Notify AcceptStream
+				select {
+				case s.session.newStream <- r: // Notify AcceptStream
+				case <-s.session.closing:
+					return nil
+				}
 			}
 
 			readStream, ok := r.(*ReadStreamSRTCP)

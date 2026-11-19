@@ -326,6 +326,9 @@ func (r *ReadStreamSRTP) SetRTX(ssrc uint32) error { //nolint:cyclop
 		return errStreamAlreadyInited
 	}
 	if rtx == nil {
+		if session.maxReadStreams > 0 && len(session.readStreams) >= session.maxReadStreams {
+			return ErrMaxReadStreamsExceeded
+		}
 		rtx = &ReadStreamSRTP{}
 		if err := rtx.init(session, ssrc); err != nil {
 			return err

@@ -15,6 +15,9 @@ var (
 	ErrMKINotFound = errors.New("MKI not found")
 	// ErrContextOptionNotUpdatable indicates an option cannot be updated after construction.
 	ErrContextOptionNotUpdatable = errors.New("option can only be set during context construction")
+	// ErrMaxReadStreamsExceeded is returned when a new per-SSRC read stream cannot be
+	// created because the session's configured MaxReadStreams limit has been reached.
+	ErrMaxReadStreamsExceeded = errors.New("maximum number of read streams exceeded")
 
 	errDuplicated                    = errors.New("duplicated packet")
 	errShortSrtpMasterKey            = errors.New("SRTP master key is not long enough")
@@ -24,6 +27,7 @@ var (
 	errExporterWrongLabel            = errors.New("exporter called with wrong label")
 	errNoConfig                      = errors.New("no config provided")
 	errNoConn                        = errors.New("no conn provided")
+	errInvalidMaxReadStreams         = errors.New("MaxReadStreams must be zero (unlimited) or positive")
 	errTooShortRTP                   = errors.New("packet is too short to be RTP packet")
 	errTooShortRTCP                  = errors.New("packet is too short to be RTCP packet")
 	errPayloadDiffers                = errors.New("payload differs")

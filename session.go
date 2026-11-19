@@ -32,9 +32,18 @@ type session struct {
 	started chan any
 	closed  chan any
 
+	// closeOnce guards closing, which is closed either by Close or by the read
+	// loop when it exits on its own (read error or AcceptStreamTimeout).
+	closeOnce sync.Once
+	closing   chan any
+	closeErr  error
+
 	readStreamsClosed bool
 	readStreams       map[uint32]readStream
 	readStreamsLock   sync.Mutex
+	// maxReadStreams bounds the number of concurrently registered read streams.
+	// A zero value means no limit.
+	maxReadStreams int
 
 	log           logging.LeveledLogger
 	bufferFactory func(packetType packetio.BufferPacketType, ssrc uint32) io.ReadWriteCloser
@@ -54,6 +63,14 @@ type Config struct {
 	LoggerFactory       logging.LoggerFactory
 	AcceptStreamTimeout time.Time
 
+	// MaxReadStreams limits the number of per-SSRC read streams the remote peer can
+	// force the session to retain. The limit is only enforced after a packet has been
+	// authenticated, so an unauthenticated peer cannot trigger the rejection path.
+	// Streams created with OpenReadStream, accepted via AcceptStream, and RTX repair
+	// streams all share the budget; closing a read stream releases its slot. A zero
+	// value keeps the historical unbounded behavior.
+	MaxReadStreams int
+
 	// List of local/remote context options.
 	// ReplayProtection is enabled on remote context by default.
 	// Default replay protection window size is 64.
@@ -68,29 +85,35 @@ type SessionKeys struct {
 	RemoteMasterSalt []byte
 }
 
-func (s *session) getOrCreateReadStream(ssrc uint32, child streamSession, proto func() readStream) (readStream, bool) {
+func (s *session) getOrCreateReadStream(
+	ssrc uint32, child streamSession, proto func() readStream,
+) (readStream, bool, error) {
 	s.readStreamsLock.Lock()
 	defer s.readStreamsLock.Unlock()
 
 	if s.readStreamsClosed {
-		return nil, false
+		return nil, false, nil
 	}
 
 	rStream, ok := s.readStreams[ssrc]
 	if ok {
-		return rStream, false
+		return rStream, false, nil
+	}
+
+	if s.maxReadStreams > 0 && len(s.readStreams) >= s.maxReadStreams {
+		return nil, false, ErrMaxReadStreamsExceeded
 	}
 
 	// Create the readStream.
 	rStream = proto()
 
 	if err := rStream.init(child, ssrc); err != nil {
-		return nil, false
+		return nil, false, err
 	}
 
 	s.readStreams[ssrc] = rStream
 
-	return rStream, true
+	return rStream, true, nil
 }
 
 func (s *session) removeReadStream(ssrc uint32) {
@@ -105,18 +128,25 @@ func (s *session) removeReadStream(ssrc uint32) {
 }
 
 func (s *session) close() error {
-	if s.nextConn == nil {
-		return nil
-	} else if err := s.nextConn.Close(); err != nil {
-		return err
-	}
+	s.closeOnce.Do(func() {
+		// Unblock the read loop's newStream notification before closing the
+		// connection, so Close always completes even when no one calls
+		// AcceptStream or a buffered custom stream blocks writes.
+		close(s.closing)
+
+		if s.nextConn != nil {
+			if err := s.nextConn.Close(); err != nil {
+				s.closeErr = err
+			}
+		}
+	})
 
 	for range s.newStream {
 	}
 
 	<-s.closed
 
-	return nil
+	return s.closeErr
 }
 
 //nolint:cyclop
@@ -147,6 +177,11 @@ func (s *session) start(
 			s.readStreamsLock.Lock()
 			s.readStreamsClosed = true
 			s.readStreamsLock.Unlock()
+			// Release close() even when the loop exits on its own (read error or
+			// AcceptStreamTimeout); closeOnce ensures closing is never closed twice.
+			s.closeOnce.Do(func() {
+				close(s.closing)
+			})
 			close(s.closed)
 		}()
 

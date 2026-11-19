@@ -34,6 +34,8 @@ func NewSessionSRTP(conn net.Conn, config *Config) (*SessionSRTP, error) { //nol
 		return nil, errNoConfig
 	} else if conn == nil {
 		return nil, errNoConn
+	} else if config.MaxReadStreams < 0 {
+		return nil, errInvalidMaxReadStreams
 	}
 
 	loggerFactory := config.LoggerFactory
@@ -60,10 +62,12 @@ func NewSessionSRTP(conn net.Conn, config *Config) (*SessionSRTP, error) { //nol
 			remoteOptions:       remoteOpts,
 			readStreams:         map[uint32]readStream{},
 			newStream:           make(chan readStream),
+			closing:             make(chan any),
 			acceptStreamTimeout: config.AcceptStreamTimeout,
 			started:             make(chan any),
 			closed:              make(chan any),
 			bufferFactory:       config.BufferFactory,
+			maxReadStreams:      config.MaxReadStreams,
 			log:                 loggerFactory.NewLogger("srtp"),
 		},
 	}
@@ -90,7 +94,10 @@ func (s *SessionSRTP) OpenWriteStream() (*WriteStreamSRTP, error) {
 // OpenReadStream opens a read stream for the given SSRC, it can be used
 // if you want a certain SSRC, but don't want to wait for AcceptStream.
 func (s *SessionSRTP) OpenReadStream(ssrc uint32) (*ReadStreamSRTP, error) {
-	r, _ := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTP)
+	r, _, err := s.session.getOrCreateReadStream(ssrc, s, newReadStreamSRTP)
+	if err != nil {
+		return nil, err
+	}
 
 	if readStream, ok := r.(*ReadStreamSRTP); ok {
 		return readStream, nil
@@ -219,14 +226,23 @@ func (s *SessionSRTP) decrypt(buf []byte, attrs packetio.Attributes) error {
 		return err
 	}
 
-	r, isNew := s.session.getOrCreateReadStream(header.SSRC, s, newReadStreamSRTP)
+	r, isNew, err := s.session.getOrCreateReadStream(header.SSRC, s, newReadStreamSRTP)
+	if err != nil {
+		return err
+	}
 	if r == nil {
 		return nil // Session has been closed
 	} else if isNew {
 		if !s.session.acceptStreamTimeout.IsZero() {
 			_ = s.session.nextConn.SetReadDeadline(time.Time{})
 		}
-		s.session.newStream <- r // Notify AcceptStream
+		// Notify AcceptStream, but give way to Close so a peer that opens many
+		// streams without any reader cannot block session shutdown.
+		select {
+		case s.session.newStream <- r:
+		case <-s.session.closing:
+			return nil
+		}
 	}
 
 	readStream, ok := r.(*ReadStreamSRTP)
