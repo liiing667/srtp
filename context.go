@@ -49,6 +49,14 @@ type srtcpSSRCState struct {
 	checkAccepter replaydetector.CheckAccepter
 }
 
+// mkiKey is the key under which per-master-key state is stored. The empty
+// string is used when MKI support is disabled, so contexts without MKI keep
+// a single state per SSRC. When MKI is enabled, each MKI value gets its own
+// rollover counter and replay detector: sequence numbers and replay
+// protection are bound to the key identity (MKI generation) instead of being
+// shared across master keys for the same SSRC.
+type mkiKey = string
+
 // RCCMode is the mode of Roll-over Counter Carrying Transform from RFC 4771.
 type RCCMode int
 
@@ -94,8 +102,12 @@ type Context struct {
 
 	cipher srtpCipher
 
-	srtpSSRCStates  map[uint32]*srtpSSRCState
-	srtcpSSRCStates map[uint32]*srtcpSSRCState
+	// Per-SSRC, per-MKI state. The outer key is the SSRC and the inner key is
+	// the packet's MKI (empty when MKI support is disabled). Keeping the state
+	// per MKI binds the rollover counter, sequence tracking and replay window
+	// to the master key that authenticated the packet.
+	srtpSSRCStates  map[uint32]map[mkiKey]*srtpSSRCState
+	srtcpSSRCStates map[uint32]map[mkiKey]*srtcpSSRCState
 
 	newSRTCPReplayDetector func() replaydetector.ReplayDetector
 	newSRTPReplayDetector  func() replaydetector.ReplayDetector
@@ -131,8 +143,8 @@ func CreateContext(
 	opts ...ContextOption,
 ) (c *Context, err error) {
 	c = &Context{
-		srtpSSRCStates:  map[uint32]*srtpSSRCState{},
-		srtcpSSRCStates: map[uint32]*srtcpSSRCState{},
+		srtpSSRCStates:  map[uint32]map[mkiKey]*srtpSSRCState{},
+		srtcpSSRCStates: map[uint32]map[mkiKey]*srtcpSSRCState{},
 		profile:         profile,
 		mkis:            map[string]srtpCipher{},
 	}
@@ -269,6 +281,23 @@ func (c *Context) RemoveMKI(mki []byte) error {
 	}
 	delete(c.mkis, string(mki))
 
+	// The key generation is no longer accepted, so its per-SSRC state must go
+	// with it. Keeping the state would let packets from the retired key keep a
+	// replay window and rollover counter alive after the overlap period ends.
+	key := mkiKey(mki)
+	for ssrc, states := range c.srtpSSRCStates {
+		delete(states, key)
+		if len(states) == 0 {
+			delete(c.srtpSSRCStates, ssrc)
+		}
+	}
+	for ssrc, states := range c.srtcpSSRCStates {
+		delete(states, key)
+		if len(states) == 0 {
+			delete(c.srtcpSSRCStates, ssrc)
+		}
+	}
+
 	return nil
 }
 
@@ -339,80 +368,128 @@ func (s *srtpSSRCState) updateRolloverCount(sequenceNumber uint16, difference in
 	}
 }
 
-func (c *Context) getSRTPSSRCState(ssrc uint32, keepNew bool) (*srtpSSRCState, bool) {
-	state, ok := c.srtpSSRCStates[ssrc]
-	if ok {
-		return state, true
+// stateMKIKey returns the map key identifying the key generation for state
+// lookups. When MKI support is disabled all packets share the empty key.
+func (c *Context) stateMKIKey(mki []byte) mkiKey {
+	if len(c.sendMKI) == 0 {
+		return ""
 	}
 
-	state = &srtpSSRCState{
+	return mkiKey(mki)
+}
+
+// getSRTPSSRCState returns the SRTP state for an SSRC and MKI generation.
+// When keepNew is false a missing entry is created transiently (a fresh replay
+// detector is allocated) without inserting it into the context, so that a
+// packet failing authentication cannot mutate committed state. The boolean
+// reports whether the state was already committed.
+func (c *Context) getSRTPSSRCState(ssrc uint32, mki []byte, keepNew bool) (*srtpSSRCState, bool) {
+	key := c.stateMKIKey(mki)
+	if states, ok := c.srtpSSRCStates[ssrc]; ok {
+		if state, ok := states[key]; ok {
+			return state, true
+		}
+	}
+
+	state := &srtpSSRCState{
 		ssrc:           ssrc,
 		replayDetector: c.newSRTPReplayDetector(),
 	}
 	state.checkAccepter, _ = state.replayDetector.(replaydetector.CheckAccepter)
 	if keepNew {
-		c.srtpSSRCStates[ssrc] = state
+		c.setSRTPSSRCState(state, key)
 	}
 
 	return state, false
 }
 
-func (c *Context) getSRTCPSSRCState(ssrc uint32, keepNew bool) (*srtcpSSRCState, bool) {
-	state, ok := c.srtcpSSRCStates[ssrc]
-	if ok {
-		return state, true
+// getSRTCPSSRCState is the SRTCP counterpart of getSRTPSSRCState.
+func (c *Context) getSRTCPSSRCState(ssrc uint32, mki []byte, keepNew bool) (*srtcpSSRCState, bool) {
+	key := c.stateMKIKey(mki)
+	if states, ok := c.srtcpSSRCStates[ssrc]; ok {
+		if state, ok := states[key]; ok {
+			return state, true
+		}
 	}
 
-	state = &srtcpSSRCState{
+	state := &srtcpSSRCState{
 		ssrc:           ssrc,
 		replayDetector: c.newSRTCPReplayDetector(),
 	}
 	state.checkAccepter, _ = state.replayDetector.(replaydetector.CheckAccepter)
 	if keepNew {
-		c.srtcpSSRCStates[ssrc] = state
+		c.setSRTCPSSRCState(state, key)
 	}
 
 	return state, false
 }
 
-func (c *Context) setSRTPSSRCState(state *srtpSSRCState) {
-	c.srtpSSRCStates[state.ssrc] = state
+func (c *Context) setSRTPSSRCState(state *srtpSSRCState, key mkiKey) {
+	states, ok := c.srtpSSRCStates[state.ssrc]
+	if !ok {
+		states = map[mkiKey]*srtpSSRCState{}
+		c.srtpSSRCStates[state.ssrc] = states
+	}
+	states[key] = state
 }
 
-func (c *Context) setSRTCPSSRCState(state *srtcpSSRCState) {
-	c.srtcpSSRCStates[state.ssrc] = state
+func (c *Context) setSRTCPSSRCState(state *srtcpSSRCState, key mkiKey) {
+	states, ok := c.srtcpSSRCStates[state.ssrc]
+	if !ok {
+		states = map[mkiKey]*srtcpSSRCState{}
+		c.srtcpSSRCStates[state.ssrc] = states
+	}
+	states[key] = state
 }
 
 // ROC returns SRTP rollover counter value of specified SSRC.
 func (c *Context) ROC(ssrc uint32) (uint32, bool) {
-	state, ok := c.srtpSSRCStates[ssrc]
+	states, ok := c.srtpSSRCStates[ssrc]
 	if !ok {
 		return 0, false
 	}
 
-	return uint32(state.index >> 16), true //nolint:gosec // G115
+	// Prefer the state of the key currently used for sending, which is also the
+	// generation ROC/SetROC operate on when MKI is enabled.
+	key := c.stateMKIKey(c.sendMKI)
+	if state, ok := states[key]; ok {
+		return uint32(state.index >> 16), true //nolint:gosec // G115
+	}
+	for _, state := range states {
+		return uint32(state.index >> 16), true //nolint:gosec // G115
+	}
+
+	return 0, false
 }
 
 // SetROC sets SRTP rollover counter value of specified SSRC.
 func (c *Context) SetROC(ssrc uint32, roc uint32) {
-	state, _ := c.getSRTPSSRCState(ssrc, true)
+	state, _ := c.getSRTPSSRCState(ssrc, c.sendMKI, true)
 	state.index = uint64(roc) << 16
 	state.rolloverHasProcessed = false
 }
 
 // Index returns SRTCP index value of specified SSRC.
 func (c *Context) Index(ssrc uint32) (uint32, bool) {
-	state, ok := c.srtcpSSRCStates[ssrc]
+	states, ok := c.srtcpSSRCStates[ssrc]
 	if !ok {
 		return 0, false
 	}
 
-	return state.srtcpIndex, true
+	key := c.stateMKIKey(c.sendMKI)
+	if state, ok := states[key]; ok {
+		return state.srtcpIndex, true
+	}
+	for _, state := range states {
+		return state.srtcpIndex, true
+	}
+
+	return 0, false
 }
 
 // SetIndex sets SRTCP index value of specified SSRC.
 func (c *Context) SetIndex(ssrc uint32, index uint32) {
-	state, _ := c.getSRTCPSSRCState(ssrc, true)
+	state, _ := c.getSRTCPSSRCState(ssrc, c.sendMKI, true)
 	state.srtcpIndex = index % (maxSRTCPIndex + 1)
 }
 

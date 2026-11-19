@@ -757,3 +757,127 @@ func TestSRTCPFailedAuthDoesNotGrowSSRCMap(t *testing.T) {
 	t.Run("CTR", func(t *testing.T) { testSRTCPFailedAuthDoesNotGrowSSRCMap(t, profileCTR) })
 	t.Run("GCM", func(t *testing.T) { testSRTCPFailedAuthDoesNotGrowSSRCMap(t, profileGCM) })
 }
+
+// encryptRTCPWithMKI encrypts one RTCP packet for a media SSRC with the
+// provided (already MKI-configured) context.
+func encryptRTCPWithMKI(t *testing.T, ctx *Context, mediaSSRC uint32) []byte {
+	t.Helper()
+
+	raw, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.PictureLossIndication{SenderSSRC: mediaSSRC, MediaSSRC: mediaSSRC},
+	})
+	assert.NoError(t, err)
+
+	encrypted, err := ctx.EncryptRTCP(nil, raw, nil)
+	assert.NoError(t, err)
+
+	return encrypted
+}
+
+// TestRTCPMKIReplayIsolation verifies that the SRTCP index tracking and replay
+// window are bound to the MKI (key generation), not shared across master keys
+// for the same SSRC.
+func TestRTCPMKIReplayIsolation(t *testing.T) { //nolint:cyclop
+	test := func(t *testing.T, profile ProtectionProfile) {
+		t.Helper()
+
+		mki1 := []byte{0x01, 0x02, 0x03, 0x04}
+		mki2 := []byte{0x02, 0x03, 0x04, 0x05}
+
+		keyLen, err := profile.KeyLen()
+		assert.NoError(t, err)
+		saltLen, err := profile.SaltLen()
+		assert.NoError(t, err)
+		baseKey := make([]byte, keyLen)
+		baseSalt := make([]byte, saltLen)
+		for i := range baseKey {
+			baseKey[i] = 0x0d
+		}
+		for i := range baseSalt {
+			baseSalt[i] = 0x62
+		}
+
+		encryptContext1, err := CreateContext(baseKey, baseSalt, profile,
+			MasterKeyIndicator(mki1), SRTCPReplayProtection(10))
+		assert.NoError(t, err)
+
+		masterKey2, masterSalt2 := mkiTestKeyingMaterial(profile)
+		encryptContext2, err := CreateContext(masterKey2, masterSalt2, profile,
+			MasterKeyIndicator(mki2), SRTCPReplayProtection(10))
+		assert.NoError(t, err)
+
+		decryptContext, err := CreateContext(baseKey, baseSalt, profile,
+			MasterKeyIndicator(mki1), SRTCPReplayProtection(10))
+		assert.NoError(t, err)
+		assert.NoError(t, decryptContext.AddCipherForMKI(mki2, masterKey2, masterSalt2))
+
+		const ssrc uint32 = 0xDEADBEEF
+
+		// Each generation starts its SRTCP index at 1. With per-MKI state both
+		// are accepted; a shared window would treat the second one as replayed.
+		enc1 := encryptRTCPWithMKI(t, encryptContext1, ssrc)
+		enc2 := encryptRTCPWithMKI(t, encryptContext2, ssrc)
+
+		_, err = decryptContext.DecryptRTCP(nil, enc1, nil)
+		assert.NoError(t, err, "first generation packet must be accepted during the overlap period")
+		_, err = decryptContext.DecryptRTCP(nil, enc2, nil)
+		assert.NoError(t, err, "new generation packet with the same SSRC/index must use its own window")
+
+		// Replay is still detected within each generation.
+		_, err = decryptContext.DecryptRTCP(nil, enc1, nil)
+		assert.ErrorIs(t, err, errDuplicated, "replayed old-generation packet must be rejected")
+		_, err = decryptContext.DecryptRTCP(nil, enc2, nil)
+		assert.ErrorIs(t, err, errDuplicated, "replayed new-generation packet must be rejected")
+
+		states, ok := decryptContext.srtcpSSRCStates[ssrc]
+		assert.True(t, ok)
+		assert.Len(t, states, 2, "each MKI must own its state for the SSRC")
+
+		// After retiring mki1 its packets are rejected and its state is removed,
+		// while mki2 keeps working. The active send MKI is switched first
+		// because RemoveMKI refuses to remove the send MKI.
+		assert.NoError(t, decryptContext.SetSendMKI(mki2))
+		assert.NoError(t, decryptContext.RemoveMKI(mki1))
+		_, err = decryptContext.DecryptRTCP(nil, enc1, nil)
+		assert.ErrorIs(t, err, ErrMKINotFound, "retired generation must not be accepted after removal")
+		assert.NotContains(t, decryptContext.srtcpSSRCStates[ssrc], mkiKey(mki1),
+			"retired generation state must be cleaned up")
+
+		enc2Next := encryptRTCPWithMKI(t, encryptContext2, ssrc)
+		_, err = decryptContext.DecryptRTCP(nil, enc2Next, nil)
+		assert.NoError(t, err, "current generation must keep receiving after the old MKI is removed")
+	}
+
+	t.Run("CTR", func(t *testing.T) { test(t, profileCTR) })
+	t.Run("GCM", func(t *testing.T) { test(t, profileGCM) })
+}
+
+// TestRTCPMKIBadPacketDoesNotAdvanceState verifies that failing authentication
+// never commits SRTCP replay state, including for the first packet of a
+// (SSRC, MKI) generation.
+func TestRTCPMKIBadPacketDoesNotAdvanceState(t *testing.T) {
+	test := func(t *testing.T, profile ProtectionProfile) {
+		t.Helper()
+
+		mki1 := []byte{0x01, 0x02, 0x03, 0x04}
+
+		encryptCtx, err := buildTestContext(profile, MasterKeyIndicator(mki1), SRTCPReplayProtection(10))
+		assert.NoError(t, err)
+
+		keyLen, err := profile.KeyLen()
+		assert.NoError(t, err)
+		saltLen, err := profile.SaltLen()
+		assert.NoError(t, err)
+		decryptCtx, err := CreateContext(make([]byte, keyLen), make([]byte, saltLen), profile,
+			MasterKeyIndicator(mki1), SRTCPReplayProtection(10))
+		assert.NoError(t, err)
+
+		enc := encryptRTCPWithMKI(t, encryptCtx, 0xCAFEBABE)
+		_, err = decryptCtx.DecryptRTCP(nil, enc, nil)
+		assert.Error(t, err)
+		assert.Empty(t, decryptCtx.srtcpSSRCStates, "failed auth must not commit SSRC/MKI state")
+	}
+
+	t.Run("CTR", func(t *testing.T) { test(t, profileCTR) })
+	t.Run("GCM", func(t *testing.T) { test(t, profileGCM) })
+}

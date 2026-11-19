@@ -96,8 +96,8 @@ func newSrtpCipherAeadAesGcmWithDerivedKeys(
 // createContextWithCipher creates a new SRTP Context with a pre-created cipher. This is used for testing purposes only.
 func createContextWithCipher(profile ProtectionProfile, cipher srtpCipher) (*Context, error) {
 	ctx := &Context{
-		srtpSSRCStates:  map[uint32]*srtpSSRCState{},
-		srtcpSSRCStates: map[uint32]*srtcpSSRCState{},
+		srtpSSRCStates:  map[uint32]map[mkiKey]*srtpSSRCState{},
+		srtcpSSRCStates: map[uint32]map[mkiKey]*srtcpSSRCState{},
 		profile:         profile,
 		mkis:            map[string]srtpCipher{},
 		cipher:          cipher,

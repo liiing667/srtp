@@ -41,11 +41,28 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 		return nil, fmt.Errorf("%w: %d", errTooShortRTP, len(ciphertext))
 	}
 
+	// Resolve the key generation (MKI) before touching any sequence/replay
+	// state. An unknown MKI is rejected without advancing a replay window or a
+	// rollover counter, and replay protection stays bound to the master key
+	// that will authenticate the packet rather than being shared across keys.
+	cipher := c.cipher
+	var actualMKI []byte
+	var ok bool
+	if len(c.mkis) > 0 {
+		actualMKI = ciphertext[len(ciphertext)-mkiLen-authTagLen : len(ciphertext)-authTagLen]
+		cipher, ok = c.mkis[string(actualMKI)]
+		if !ok {
+			return nil, ErrMKINotFound
+		}
+	}
+
 	// The SSRC in the RTP header is unauthenticated at this point. getSRTPSSRCState is
 	// called in read-only mode (existingState tracks whether it was pre-existing) so that
 	// no new map entry is inserted until after the auth tag has been verified. The state
 	// is committed to the map by setSRTPSSRCState only after Accept() succeeds below.
-	ssrcState, existingState := c.getSRTPSSRCState(header.SSRC, false)
+	// State is keyed by both SSRC and MKI, so each key generation has its own rollover
+	// counter and replay window.
+	ssrcState, existingState := c.getSRTPSSRCState(header.SSRC, actualMKI, false)
 
 	var roc uint32
 	var diff int64
@@ -69,7 +86,6 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 	// detectors without CheckAccepter support) is explicitly called below.
 	var markAsValid func() bool
 	var tok replaydetector.Token
-	var ok bool
 	if ssrcState.checkAccepter != nil {
 		tok = ssrcState.checkAccepter.CheckSeq(index)
 		ok = tok.Passed()
@@ -87,16 +103,6 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 		return nil, err
 	}
 
-	cipher := c.cipher
-	if len(c.mkis) > 0 {
-		// Find cipher for MKI
-		actualMKI := ciphertext[len(ciphertext)-mkiLen-authTagLen : len(ciphertext)-authTagLen]
-		cipher, ok = c.mkis[string(actualMKI)]
-		if !ok {
-			return nil, ErrMKINotFound
-		}
-	}
-
 	dst = growBufferSize(dst, len(ciphertext)-authTagLen-mkiLen)
 
 	dst, err = cipher.decryptRTP(dst, ciphertext, header, headerLen, roc, hasRocInPacket)
@@ -112,7 +118,7 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 	ssrcState.updateRolloverCount(header.SequenceNumber, diff, hasRocInPacket, roc)
 
 	if !existingState {
-		c.setSRTPSSRCState(ssrcState)
+		c.setSRTPSSRCState(ssrcState, c.stateMKIKey(actualMKI))
 	}
 
 	return dst, nil
@@ -162,7 +168,7 @@ func (c *Context) encryptRTP(dst []byte, header *rtp.Header, headerLen int, plai
 		return nil, errUnsupportedHeaderExtension
 	}
 
-	ssrcState, _ := c.getSRTPSSRCState(header.SSRC, true)
+	ssrcState, _ := c.getSRTPSSRCState(header.SSRC, c.sendMKI, true)
 	roc, diff, ovf := ssrcState.nextRolloverCount(header.SequenceNumber)
 	if ovf {
 		// ... when 2^48 SRTP packets or 2^31 SRTCP packets have been secured with the same key
