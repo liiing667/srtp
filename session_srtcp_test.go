@@ -368,7 +368,7 @@ func TestSessionSRTCPCompoundPacket(t *testing.T) {
 	assert.NoError(t, bReadStreamSR2SR.Close())
 }
 
-func TestSessionSRTCPCompoundPacketWithEmptyDestinationSSRC(t *testing.T) {
+func TestSessionSRTCPCompoundPacketUnknownTypeIsRejected(t *testing.T) {
 	lim := test.TimeOut(time.Second * 5)
 	defer lim.Stop()
 
@@ -378,8 +378,9 @@ func TestSessionSRTCPCompoundPacketWithEmptyDestinationSSRC(t *testing.T) {
 	testSSRCSenderReportSR := uint32(0x902f9e2e)
 	testSSRCSenderReportRR := uint32(0xbc5e9a40)
 	// Unknown packet type (221), parsed as rtcp.RawPacket whose
-	// DestinationSSRC() is empty. It should still be delivered to every
-	// stream the compound packet is addressed to.
+	// DestinationSSRC() is empty. It has no routing identity of its own, so it
+	// must not be broadcast to the streams addressed by the rest of the
+	// compound packet.
 	rawPacket := rtcp.RawPacket([]byte{
 		0x80, 0xdd, 0x00, 0x01,
 		0x01, 0x02, 0x03, 0x04,
@@ -402,55 +403,263 @@ func TestSessionSRTCPCompoundPacketWithEmptyDestinationSSRC(t *testing.T) {
 		&rawPacket,
 	}
 
-	done := make(chan struct{})
-	go func() {
-		readBuffer := make([]byte, 200)
-
-		// stream for the sender SSRC: SenderReport, SourceDescription, RawPacket
-		_, header, rerr := bReadStreamSR.ReadRTCP(readBuffer)
-		assert.NoError(t, rerr)
-		assert.Equal(t, rtcp.TypeSenderReport, header.Type)
-
-		_, header, rerr = bReadStreamSR.ReadRTCP(readBuffer)
-		assert.NoError(t, rerr)
-		assert.Equal(t, rtcp.TypeSourceDescription, header.Type)
-
-		n, header, rerr := bReadStreamSR.ReadRTCP(readBuffer)
-		assert.NoError(t, rerr)
-		assert.Equal(t, rtcp.PacketType(221), header.Type)
-		assert.Equal(t, []byte(rawPacket), readBuffer[:n])
-
-		// stream for the reception report SSRC: SenderReport, RawPacket
-		_, header, rerr = bReadStreamRR.ReadRTCP(readBuffer)
-		assert.NoError(t, rerr)
-		assert.Equal(t, rtcp.TypeSenderReport, header.Type)
-
-		n, header, rerr = bReadStreamRR.ReadRTCP(readBuffer)
-		assert.NoError(t, rerr)
-		assert.Equal(t, rtcp.PacketType(221), header.Type)
-		assert.Equal(t, []byte(rawPacket), readBuffer[:n])
-
-		close(done)
-	}()
-
 	encrypted, err := encryptSRTCP(aSession.session.localContext, cp)
 	assert.NoError(t, err)
-	_, err = aSession.session.nextConn.Write(encrypted)
-	assert.NoError(t, err)
 
-	<-done
+	// The unknown segment is rejected with an auditable error while the
+	// authenticated segments with their own destinations are still delivered.
+	err = bSession.decrypt(encrypted, nil)
+	assert.ErrorIs(t, err, ErrRTCPUnknownPacketType)
 
 	assert.NoError(t, aSession.Close())
 	assert.NoError(t, bSession.Close())
 	assert.NoError(t, bReadStreamSR.Close())
 	assert.NoError(t, bReadStreamRR.Close())
 
-	// Each packet must have been delivered only once to each destination.
+	// The known segments reach only their own destinations; the unknown
+	// segment must not have been delivered to either stream.
 	readBuffer := make([]byte, 200)
-	_, err = bReadStreamSR.Read(readBuffer)
-	assert.ErrorIs(t, err, io.EOF)
-	_, err = bReadStreamRR.Read(readBuffer)
-	assert.ErrorIs(t, err, io.EOF)
+
+	_, header, rerr := bReadStreamSR.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeSenderReport, header.Type)
+
+	_, header, rerr = bReadStreamSR.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeSourceDescription, header.Type)
+
+	_, rerr = bReadStreamSR.Read(readBuffer)
+	assert.ErrorIs(t, rerr, io.EOF)
+
+	n, header, rerr := bReadStreamRR.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeSenderReport, header.Type)
+	assert.NotEqual(t, rtcp.PacketType(221), header.Type)
+
+	_, rerr = bReadStreamRR.Read(readBuffer)
+	assert.ErrorIs(t, rerr, io.EOF)
+
+	assert.NotContains(t, readBuffer[:n], []byte(rawPacket))
+}
+
+func TestSessionSRTCPUnknownTypeDoesNotBlockReadLoop(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// End-to-end check over a real transport: an authenticated compound that
+	// contains an unroutable unknown segment must drop only that segment, keep
+	// delivering the known segments, and leave the read loop healthy.
+	ssrc := uint32(4242)
+	unknown := rtcp.RawPacket([]byte{
+		0x80, 0xdd, 0x00, 0x01,
+		0x01, 0x02, 0x03, 0x04,
+	})
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+	readStream, err := bSession.OpenReadStream(ssrc)
+	assert.NoError(t, err)
+
+	firstCompound, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.PictureLossIndication{MediaSSRC: ssrc},
+		&unknown,
+	})
+	assert.NoError(t, err)
+	firstEncrypted, err := aSession.session.localContext.EncryptRTCP(nil, firstCompound, nil)
+	assert.NoError(t, err)
+
+	secondCompound, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.Goodbye{Sources: []uint32{ssrc}},
+	})
+	assert.NoError(t, err)
+	secondEncrypted, err := aSession.session.localContext.EncryptRTCP(nil, secondCompound, nil)
+	assert.NoError(t, err)
+
+	_, err = aSession.session.nextConn.Write(firstEncrypted)
+	assert.NoError(t, err)
+	_, err = aSession.session.nextConn.Write(secondEncrypted)
+	assert.NoError(t, err)
+
+	readBuffer := make([]byte, 200)
+
+	n, header, rerr := readStream.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypePayloadSpecificFeedback, header.Type)
+	assert.NotContains(t, readBuffer[:n], []byte(unknown))
+
+	// A subsequent, fully routable compound still arrives, proving the read
+	// loop was not torn down by the rejected unknown segment.
+	_, header, rerr = readStream.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeGoodbye, header.Type)
+
+	assert.NoError(t, readStream.Close())
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+func TestSessionSRTCPReceiverReportWithoutReportsRoutesToSender(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// A Receiver Report without reception reports has no destination SSRC,
+	// but its sender SSRC gives it an explicit routing identity.
+	senderSSRC := uint32(0x12345678)
+	otherSSRC := uint32(0x87654321)
+	rr := &rtcp.ReceiverReport{SSRC: senderSSRC}
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+	senderStream, err := bSession.OpenReadStream(senderSSRC)
+	assert.NoError(t, err)
+	otherStream, err := bSession.OpenReadStream(otherSSRC)
+	assert.NoError(t, err)
+
+	compound, err := rtcp.Marshal([]rtcp.Packet{rr})
+	assert.NoError(t, err)
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+
+	assert.NoError(t, bSession.decrypt(encrypted, nil))
+
+	assert.NoError(t, senderStream.Close())
+	assert.NoError(t, otherStream.Close())
+
+	readBuffer := make([]byte, 200)
+	n, header, rerr := senderStream.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeReceiverReport, header.Type)
+
+	decoded := &rtcp.ReceiverReport{}
+	assert.NoError(t, decoded.Unmarshal(readBuffer[:n]))
+	assert.Equal(t, senderSSRC, decoded.SSRC)
+
+	_, rerr = senderStream.Read(readBuffer)
+	assert.ErrorIs(t, rerr, io.EOF)
+
+	// The report must not be broadcast to unrelated streams.
+	_, rerr = otherStream.Read(readBuffer)
+	assert.ErrorIs(t, rerr, io.EOF)
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+func TestSessionSRTCPKnownTypeWithoutRoutableSSRC(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// A BYE with zero sources is a valid RTCP header but carries neither a
+	// destination nor a sender SSRC. It must be rejected auditable instead of
+	// being broadcast, and must not create a read stream.
+	emptyBye := []byte{0x80, 0xcb, 0x00, 0x00}
+	pli, err := (&rtcp.PictureLossIndication{MediaSSRC: 5000}).Marshal()
+	assert.NoError(t, err)
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+	readStream, err := bSession.OpenReadStream(5000)
+	assert.NoError(t, err)
+
+	compound := append(append([]byte{}, emptyBye...), pli...)
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+
+	decryptErr := bSession.decrypt(encrypted, nil)
+	assert.ErrorIs(t, decryptErr, ErrRTCPNoRoutableSSRC)
+
+	bSession.session.readStreamsLock.Lock()
+	streamCount := len(bSession.session.readStreams)
+	bSession.session.readStreamsLock.Unlock()
+	assert.Equal(t, 1, streamCount, "the rejected segment must not create a stream")
+
+	assert.NoError(t, readStream.Close())
+
+	// The segment with its own SSRC is still delivered exactly once.
+	readBuffer := make([]byte, 200)
+	n, readErr := readStream.Read(readBuffer)
+	assert.NoError(t, readErr)
+	assert.Equal(t, pli, readBuffer[:n])
+
+	_, readErr = readStream.Read(readBuffer)
+	assert.ErrorIs(t, readErr, io.EOF)
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
+}
+
+func TestSessionSRTCPMultiSSRCCompoundRouting(t *testing.T) {
+	lim := test.TimeOut(time.Second * 5)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	ssrcA := uint32(1000)
+	ssrcB := uint32(2000)
+	ssrcC := uint32(3000)
+
+	aSession, bSession := buildSessionSRTCPPair(t)
+	streamA, err := bSession.OpenReadStream(ssrcA)
+	assert.NoError(t, err)
+	streamB, err := bSession.OpenReadStream(ssrcB)
+	assert.NoError(t, err)
+	streamC, err := bSession.OpenReadStream(ssrcC)
+	assert.NoError(t, err)
+
+	// Each authenticated segment carries its own routing identity.
+	compound, err := rtcp.Marshal([]rtcp.Packet{
+		&rtcp.SenderReport{SSRC: ssrcA},
+		&rtcp.PictureLossIndication{MediaSSRC: ssrcB},
+		&rtcp.Goodbye{Sources: []uint32{ssrcC}},
+	})
+	assert.NoError(t, err)
+	encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
+	assert.NoError(t, err)
+
+	assert.NoError(t, bSession.decrypt(encrypted, nil))
+
+	assert.NoError(t, streamA.Close())
+	assert.NoError(t, streamB.Close())
+	assert.NoError(t, streamC.Close())
+
+	readBuffer := make([]byte, 200)
+
+	n, header, rerr := streamA.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeSenderReport, header.Type)
+	sr := &rtcp.SenderReport{}
+	assert.NoError(t, sr.Unmarshal(readBuffer[:n]))
+	assert.Equal(t, ssrcA, sr.SSRC)
+
+	n, header, rerr = streamB.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypePayloadSpecificFeedback, header.Type)
+	pli := &rtcp.PictureLossIndication{}
+	assert.NoError(t, pli.Unmarshal(readBuffer[:n]))
+	assert.Equal(t, ssrcB, pli.MediaSSRC)
+
+	n, header, rerr = streamC.ReadRTCP(readBuffer)
+	assert.NoError(t, rerr)
+	assert.Equal(t, rtcp.TypeGoodbye, header.Type)
+	bye := &rtcp.Goodbye{}
+	assert.NoError(t, bye.Unmarshal(readBuffer[:n]))
+	assert.Equal(t, []uint32{ssrcC}, bye.Sources)
+
+	// Every stream received exactly one segment.
+	for _, stream := range []*ReadStreamSRTCP{streamA, streamB, streamC} {
+		_, rerr = stream.Read(readBuffer)
+		assert.ErrorIs(t, rerr, io.EOF)
+	}
+
+	assert.NoError(t, aSession.Close())
+	assert.NoError(t, bSession.Close())
 }
 
 func TestSessionSRTCPDuplicateDestinations(t *testing.T) {
@@ -551,9 +760,9 @@ func TestSessionSRTCPDecryptDestinationParseFailure(t *testing.T) {
 			expected: [][]byte{pli},
 		},
 		{
-			name:     "discard partial fallback destinations",
+			name:     "reject unknown packet instead of broadcasting it",
 			packets:  [][]byte{pli, invalidSDES, unknown},
-			expected: [][]byte{pli, unknown},
+			expected: [][]byte{pli},
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -572,7 +781,11 @@ func TestSessionSRTCPDecryptDestinationParseFailure(t *testing.T) {
 			}
 			encrypted, err := aSession.session.localContext.EncryptRTCP(nil, compound, nil)
 			assert.NoError(t, err)
-			assert.Error(t, bSession.decrypt(encrypted, nil))
+			decryptErr := bSession.decrypt(encrypted, nil)
+			assert.Error(t, decryptErr)
+			if testCase.name == "reject unknown packet instead of broadcasting it" {
+				assert.ErrorIs(t, decryptErr, ErrRTCPUnknownPacketType)
+			}
 
 			// Closing the buffers allows checking for unexpected packets
 			// without blocking after the queued packets have been read.
@@ -822,7 +1035,7 @@ func TestSessionSRTCPReadWriteDoesNotAllocate(t *testing.T) {
 		&rtcp.SourceDescription{Chunks: []rtcp.SourceDescriptionChunk{
 			{Source: testSSRC, Items: []rtcp.SourceDescriptionItem{{Type: rtcp.SDESCNAME, Text: "test"}}},
 		}},
-		&rtcp.RawPacket{0x80, 0xdd, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04},
+		&rtcp.PictureLossIndication{MediaSSRC: testSSRC},
 	}
 
 	for name, replayOptions := range map[string][]ContextOption{

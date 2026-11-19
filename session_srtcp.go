@@ -4,7 +4,9 @@
 package srtp
 
 import (
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"time"
@@ -30,11 +32,6 @@ type SessionSRTCP struct {
 
 	// destinationSSRCs is a scratch slice used internally in decrypt to avoid allocations.
 	destinationSSRCs []uint32
-
-	// compoundSSRCs is a scratch slice used internally in decrypt to avoid allocations. It
-	// is lazily populated upon receiving an unknown RTCP type with the SSRCs of all known
-	// types in a compound RTCP packet.
-	compoundSSRCs []uint32
 }
 
 // NewSessionSRTCP creates a SRTCP session using conn as the underlying transport.
@@ -174,21 +171,43 @@ func dedupeSSRCs(ssrcs []uint32) []uint32 {
 	return slices.Compact(ssrcs)
 }
 
-// appendDestinationSSRCs appends destinations from packets whose SSRCs can be parsed.
-func appendDestinationSSRCs(dst []uint32, pkts []rtcp.RawPacket) []uint32 {
-	for _, pkt := range pkts {
-		ssrcCount := len(dst)
-		var err error
-		dst, err = pkt.ParseDestinationSSRC(dst)
-		if err != nil {
-			// A failed parse may have appended partial destinations.
-			dst = dst[:ssrcCount]
-		}
+// isUnknownRTCPType reports whether pkt uses an RTCP packet type that this
+// implementation cannot attribute to a destination SSRC. ParseDestinationSSRC
+// returns no destinations both for unknown types and for known types that
+// legitimately address only their sender, so the header type distinguishes the
+// two.
+func isUnknownRTCPType(pkt rtcp.RawPacket) bool {
+	switch pkt.Header().Type {
+	case rtcp.TypeSenderReport,
+		rtcp.TypeReceiverReport,
+		rtcp.TypeSourceDescription,
+		rtcp.TypeGoodbye,
+		rtcp.TypeApplicationDefined,
+		rtcp.TypeTransportSpecificFeedback,
+		rtcp.TypePayloadSpecificFeedback,
+		rtcp.TypeExtendedReport:
+		return false
+	default:
+		return true
+	}
+}
+
+// rtcpSenderSSRC extracts the SSRC of the sender from a known RTCP packet
+// that has no destination SSRCs of its own. The common RTCP header layout
+// places the sender SSRC in the first four bytes after the four-byte header
+// for SR, RR, BYE, APP and the feedback/XR reports. SDES chunks instead carry
+// their source SSRC at the same offset for the first chunk. A packet shorter
+// than the fixed prefix has no usable routing identity.
+func rtcpSenderSSRC(pkt rtcp.RawPacket) (uint32, bool) {
+	const (
+		ssrcOffset = 4
+		ssrcLength = 4
+	)
+	if len(pkt) < ssrcOffset+ssrcLength {
+		return 0, false
 	}
 
-	dst = dedupeSSRCs(dst)
-
-	return dst
+	return binary.BigEndian.Uint32(pkt[ssrcOffset:]), true
 }
 
 // decrypt is called synchronously by the session's read loop and must not
@@ -210,7 +229,6 @@ func (s *SessionSRTCP) decrypt(buf []byte, attrs packetio.Attributes) error {
 	}
 	pkts := s.rawPackets
 
-	compoundSSRCsComputed := false
 	var parseErrs error
 	for _, pkt := range pkts {
 		s.destinationSSRCs, err = pkt.ParseDestinationSSRC(s.destinationSSRCs[:0])
@@ -224,14 +242,37 @@ func (s *SessionSRTCP) decrypt(buf []byte, attrs packetio.Attributes) error {
 
 		destinations := dedupeSSRCs(s.destinationSSRCs)
 		if len(destinations) == 0 {
-			// Packets without a destination of their own (e.g. unknown packet
-			// types parsed as rtcp.RawPacket) are delivered to every stream the
-			// compound packet is addressed to instead of being dropped.
-			if !compoundSSRCsComputed {
-				s.compoundSSRCs = appendDestinationSSRCs(s.compoundSSRCs[:0], pkts)
-				compoundSSRCsComputed = true
+			// A packet without a destination of its own can only be routed
+			// using the routing identity of another packet. That is safe for
+			// packet types this implementation knows are self-contained, but
+			// not for unknown types: broadcasting them to every stream the
+			// compound is addressed to would let an authenticated peer deliver
+			// control data to unrelated streams and overwrite their state.
+			// Reject unknown types without delivering them, and report the
+			// rejection so the drop remains auditable.
+			if isUnknownRTCPType(pkt) {
+				parseErrs = errors.Join(
+					parseErrs,
+					fmt.Errorf("%w: %d", ErrRTCPUnknownPacketType, pkt.Header().Type),
+				)
+
+				continue
 			}
-			destinations = s.compoundSSRCs
+
+			// Known packet types may legitimately have no destination SSRC
+			// (e.g. a Receiver Report without reception reports): the packet
+			// only identifies its sender, which is the explicit upper-layer
+			// routing rule for such reports.
+			senderSSRC, ok := rtcpSenderSSRC(pkt)
+			if !ok {
+				parseErrs = errors.Join(
+					parseErrs,
+					fmt.Errorf("%w: type %d", ErrRTCPNoRoutableSSRC, pkt.Header().Type),
+				)
+
+				continue
+			}
+			destinations = append(destinations[:0], senderSSRC)
 		}
 
 		for _, ssrc := range destinations {

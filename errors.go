@@ -15,6 +15,16 @@ var (
 	ErrMKINotFound = errors.New("MKI not found")
 	// ErrContextOptionNotUpdatable indicates an option cannot be updated after construction.
 	ErrContextOptionNotUpdatable = errors.New("option can only be set during context construction")
+	// ErrRTCPUnknownPacketType is returned when an authenticated compound SRTCP
+	// packet contains an RTCP packet of a type this implementation does not know
+	// how to route. Such a packet carries no destination SSRC of its own, so it
+	// cannot be attributed to any stream without an explicit upper-layer rule
+	// and is rejected instead of being broadcast to unrelated streams.
+	ErrRTCPUnknownPacketType = errors.New("rtcp packet has an unknown packet type and cannot be routed")
+	// ErrRTCPNoRoutableSSRC is returned when an authenticated RTCP packet of a
+	// known type carries neither a destination SSRC nor a readable sender SSRC,
+	// so it cannot be attributed to any stream.
+	ErrRTCPNoRoutableSSRC = errors.New("rtcp packet has no routable SSRC")
 
 	errDuplicated                    = errors.New("duplicated packet")
 	errShortSrtpMasterKey            = errors.New("SRTP master key is not long enough")
