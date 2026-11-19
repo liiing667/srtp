@@ -28,6 +28,52 @@ func TestSessionSRTPBadInit(t *testing.T) {
 	assert.Error(t, err, "NewSessionSRTP should error if no net was provided")
 }
 
+// TestSessionSRTPStartRejectsMismatchedKeys verifies that key/profile mismatches abort the
+// transaction before either context exists: a bad exporter must never produce a session that
+// could carry traffic, and no read loop may be left running on the connection.
+func TestSessionSRTPStartRejectsMismatchedKeys(t *testing.T) {
+	report := test.CheckRoutines(t)
+	defer report()
+
+	valid := keyTestKeys(t, ProtectionProfileAes128CmHmacSha1_80)
+
+	cases := []struct {
+		name    string
+		keys    SessionKeys
+		profile ProtectionProfile
+	}{
+		{
+			name:    "short local master key",
+			keys:    SessionKeys{LocalMasterKey: valid.LocalMasterKey[:1], LocalMasterSalt: valid.LocalMasterSalt, RemoteMasterKey: valid.RemoteMasterKey, RemoteMasterSalt: valid.RemoteMasterSalt},
+			profile: ProtectionProfileAes128CmHmacSha1_80,
+		},
+		{
+			name:    "short remote master salt",
+			keys:    SessionKeys{LocalMasterKey: valid.LocalMasterKey, LocalMasterSalt: valid.LocalMasterSalt, RemoteMasterKey: valid.RemoteMasterKey, RemoteMasterSalt: valid.RemoteMasterSalt[:1]},
+			profile: ProtectionProfileAes128CmHmacSha1_80,
+		},
+		{
+			name:    "unknown protection profile",
+			keys:    valid,
+			profile: ProtectionProfile(0xFFFF),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			aPipe, bPipe := net.Pipe()
+			t.Cleanup(func() {
+				assert.NoError(t, aPipe.Close())
+				assert.NoError(t, bPipe.Close())
+			})
+
+			session, err := NewSessionSRTP(aPipe, &Config{Profile: tc.profile, Keys: tc.keys})
+			assert.Error(t, err)
+			assert.Nil(t, session)
+		})
+	}
+}
+
 func TestSessionSRTPCloseWithoutAcceptStream(t *testing.T) {
 	lim := test.TimeOut(5 * time.Second)
 	defer lim.Stop()

@@ -19,6 +19,7 @@ var (
 	errDuplicated                    = errors.New("duplicated packet")
 	errShortSrtpMasterKey            = errors.New("SRTP master key is not long enough")
 	errShortSrtpMasterSalt           = errors.New("SRTP master salt is not long enough")
+	errShortKeyingMaterial           = errors.New("exported DTLS keying material does not match protection profile length")
 	errNoSuchSRTPProfile             = errors.New("no such SRTP Profile")
 	errNonZeroKDRNotSupported        = errors.New("indexOverKdr > 0 is not supported yet")
 	errExporterWrongLabel            = errors.New("exporter called with wrong label")

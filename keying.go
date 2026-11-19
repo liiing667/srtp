@@ -3,6 +3,8 @@
 
 package srtp
 
+import "fmt"
+
 const labelExtractorDtlsSrtp = "EXTRACTOR-dtls_srtp"
 
 // KeyingMaterialExporter allows package SRTP to extract keying material.
@@ -29,6 +31,15 @@ func (c *Config) ExtractSessionKeysFromDTLS(exporter KeyingMaterialExporter, isC
 		return err
 	}
 
+	// RFC 5764 requires exactly two keys and two salts for the negotiated protection
+	// profile. A short exporter would otherwise slice past the end of the buffer (panic)
+	// or silently truncate a key, while a long one would mix unrelated bytes into the
+	// session keys. Reject both instead of producing an unusable, half-populated Config.
+	expectedLen := (keyLen * 2) + (saltLen * 2)
+	if len(keyingMaterial) != expectedLen {
+		return fmt.Errorf("%w: expected(%d) actual(%d)", errShortKeyingMaterial, expectedLen, len(keyingMaterial))
+	}
+
 	offset := 0
 	clientWriteKey := append([]byte{}, keyingMaterial[offset:offset+keyLen]...)
 	offset += keyLen
@@ -41,19 +52,26 @@ func (c *Config) ExtractSessionKeysFromDTLS(exporter KeyingMaterialExporter, isC
 
 	serverWriteKey = append(serverWriteKey, keyingMaterial[offset:offset+saltLen]...)
 
+	// Build the complete key set before touching c.Keys so that a rejected exporter
+	// leaves the Config unchanged and callers cannot observe a partial key update.
+	var keys SessionKeys
 	if isClient {
-		c.Keys.LocalMasterKey = clientWriteKey[0:keyLen]
-		c.Keys.LocalMasterSalt = clientWriteKey[keyLen:]
-		c.Keys.RemoteMasterKey = serverWriteKey[0:keyLen]
-		c.Keys.RemoteMasterSalt = serverWriteKey[keyLen:]
-
-		return nil
+		keys = SessionKeys{
+			LocalMasterKey:   clientWriteKey[0:keyLen],
+			LocalMasterSalt:  clientWriteKey[keyLen:],
+			RemoteMasterKey:  serverWriteKey[0:keyLen],
+			RemoteMasterSalt: serverWriteKey[keyLen:],
+		}
+	} else {
+		keys = SessionKeys{
+			LocalMasterKey:   serverWriteKey[0:keyLen],
+			LocalMasterSalt:  serverWriteKey[keyLen:],
+			RemoteMasterKey:  clientWriteKey[0:keyLen],
+			RemoteMasterSalt: clientWriteKey[keyLen:],
+		}
 	}
 
-	c.Keys.LocalMasterKey = serverWriteKey[0:keyLen]
-	c.Keys.LocalMasterSalt = serverWriteKey[keyLen:]
-	c.Keys.RemoteMasterKey = clientWriteKey[0:keyLen]
-	c.Keys.RemoteMasterSalt = clientWriteKey[keyLen:]
+	c.Keys = keys
 
 	return nil
 }

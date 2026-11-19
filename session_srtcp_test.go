@@ -4,6 +4,7 @@
 package srtp
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -25,6 +26,72 @@ func TestSessionSRTCPBadInit(t *testing.T) {
 
 	_, err = NewSessionSRTCP(nil, &Config{})
 	assert.Error(t, err, "NewSessionSRTCP should error if no net was provided")
+}
+
+// TestSessionSRTCPStartRejectsMismatchedKeys mirrors the SRTP transaction check for SRTCP:
+// neither context may be initialized when key material does not match the profile.
+func TestSessionSRTCPStartRejectsMismatchedKeys(t *testing.T) {
+	report := test.CheckRoutines(t)
+	defer report()
+
+	profile := ProtectionProfileAes128CmHmacSha1_80
+	keyLen, err := profile.KeyLen()
+	assert.NoError(t, err)
+	saltLen, err := profile.SaltLen()
+	assert.NoError(t, err)
+
+	valid := SessionKeys{
+		LocalMasterKey:   bytes.Repeat([]byte{1}, keyLen),
+		LocalMasterSalt:  bytes.Repeat([]byte{1}, saltLen),
+		RemoteMasterKey:  bytes.Repeat([]byte{2}, keyLen),
+		RemoteMasterSalt: bytes.Repeat([]byte{2}, saltLen),
+	}
+
+	cases := []struct {
+		name    string
+		keys    SessionKeys
+		profile ProtectionProfile
+	}{
+		{
+			name: "short remote master key",
+			keys: SessionKeys{
+				LocalMasterKey:   valid.LocalMasterKey,
+				LocalMasterSalt:  valid.LocalMasterSalt,
+				RemoteMasterKey:  valid.RemoteMasterKey[:1],
+				RemoteMasterSalt: valid.RemoteMasterSalt,
+			},
+			profile: profile,
+		},
+		{
+			name: "short local master salt",
+			keys: SessionKeys{
+				LocalMasterKey:   valid.LocalMasterKey,
+				LocalMasterSalt:  valid.LocalMasterSalt[:1],
+				RemoteMasterKey:  valid.RemoteMasterKey,
+				RemoteMasterSalt: valid.RemoteMasterSalt,
+			},
+			profile: profile,
+		},
+		{
+			name:    "unknown protection profile",
+			keys:    valid,
+			profile: ProtectionProfile(0xFFFF),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			aPipe, bPipe := net.Pipe()
+			t.Cleanup(func() {
+				assert.NoError(t, aPipe.Close())
+				assert.NoError(t, bPipe.Close())
+			})
+
+			session, err := NewSessionSRTCP(aPipe, &Config{Profile: tc.profile, Keys: tc.keys})
+			assert.Error(t, err)
+			assert.Nil(t, session)
+		})
+	}
 }
 
 func buildSessionSRTCP(t *testing.T) (*SessionSRTCP, net.Conn, *Config) { //nolint:dupl

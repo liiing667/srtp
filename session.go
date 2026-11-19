@@ -125,20 +125,24 @@ func (s *session) start(
 	profile ProtectionProfile,
 	child streamSession,
 ) error {
-	var err error
-	s.localContext, err = CreateContext(localMasterKey, localMasterSalt, profile, s.localOptions...)
+	if err := s.nextConn.SetReadDeadline(s.acceptStreamTimeout); err != nil {
+		return err
+	}
+
+	localContext, err := CreateContext(localMasterKey, localMasterSalt, profile, s.localOptions...)
 	if err != nil {
 		return err
 	}
 
-	s.remoteContext, err = CreateContext(remoteMasterKey, remoteMasterSalt, profile, s.remoteOptions...)
+	remoteContext, err := CreateContext(remoteMasterKey, remoteMasterSalt, profile, s.remoteOptions...)
 	if err != nil {
 		return err
 	}
 
-	if err = s.nextConn.SetReadDeadline(s.acceptStreamTimeout); err != nil {
-		return err
-	}
+	// Commit both contexts together: a key or profile mismatch rejected above must not
+	// leave the session with only the local or only the remote context initialized.
+	s.localContext = localContext
+	s.remoteContext = remoteContext
 
 	go func() {
 		defer func() {
