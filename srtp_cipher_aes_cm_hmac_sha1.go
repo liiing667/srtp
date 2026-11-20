@@ -35,6 +35,10 @@ type srtpCipherAesCmHmacSha1 struct {
 	// Pre-allocated buffers for auth tag to avoid heap allocation in hot path.
 	authBuf     [4 + sha1.Size]byte // 4 bytes ROC + 20 bytes SHA1
 	rtcpAuthBuf [sha1.Size]byte
+
+	// rtpScratch holds a private copy of a Cryptex packet during decryption so that the
+	// CSRC/extension reordering never mutates the caller-owned input buffer.
+	rtpScratch []byte
 }
 
 func (s *srtpCipherAesCmHmacSha1) setCryptex(useCryptex bool) {
@@ -228,19 +232,31 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTP(
 		return nil, ErrFailedToVerifyAuthTag
 	}
 
+	dataLen := len(ciphertext)
+	dst = growBufferSize(dst, dataLen)
 	sameBuffer := isSameBuffer(dst, ciphertext)
 
-	err = s.doDecryptRTP(dst, ciphertext, header, headerLen, roc, sameBuffer)
+	// The tag is verified above. Decryption runs on a buffer that never aliases the caller's
+	// input packet: if dst is distinct it can serve directly, otherwise use a private scratch copy
+	// so the Cryptex reordering (and CTR output) cannot mutate the input.
+	work := dst
+	if sameBuffer {
+		if cap(s.rtpScratch) < dataLen {
+			s.rtpScratch = make([]byte, dataLen)
+		}
+		work = s.rtpScratch[:dataLen]
+	}
+	copy(work, ciphertext)
+
+	err = s.doDecryptRTP(dst, work, header, headerLen, roc)
 	if err != nil {
 		return nil, err
 	}
 
-	return dst, nil
+	return dst[:dataLen], nil
 }
 
-func (s *srtpCipherAesCmHmacSha1) doDecryptRTP(dst, ciphertext []byte, header *rtp.Header, headerLen int, roc uint32,
-	sameBuffer bool,
-) error {
+func (s *srtpCipherAesCmHmacSha1) doDecryptRTP(dst, work []byte, header *rtp.Header, headerLen int, roc uint32) error {
 	decrypt := func(dst, ciphertext []byte, headerLen int) error {
 		counter := generateCounter(header.SequenceNumber, roc, header.SSRC, s.srtpSessionSalt)
 
@@ -249,23 +265,20 @@ func (s *srtpCipherAesCmHmacSha1) doDecryptRTP(dst, ciphertext []byte, header *r
 
 	switch {
 	case isCryptexPacket(header):
-		err := decryptCryptexRTP(dst, ciphertext, sameBuffer, header, headerLen, decrypt)
+		err := decryptCryptexRTP(dst, work, header, headerLen, decrypt)
 		if err != nil {
 			return err
 		}
 	case s.srtpEncrypted:
-		// Write the plaintext header to the destination buffer.
-		if !sameBuffer {
-			copy(dst, ciphertext[:headerLen])
-		}
-
-		// Decrypt the ciphertext for the payload.
-		err := decrypt(dst, ciphertext, headerLen)
+		err := decrypt(work, work, headerLen)
 		if err != nil {
 			return err
 		}
-	case !sameBuffer:
-		copy(dst, ciphertext)
+		if !isSameBuffer(dst, work) {
+			copy(dst, work)
+		}
+	case !isSameBuffer(dst, work):
+		copy(dst, work)
 	default:
 	}
 

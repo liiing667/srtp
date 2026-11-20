@@ -114,22 +114,23 @@ func encryptCryptexRTP(dst, plaintext []byte, sameBuffer bool, header *rtp.Heade
 	return nil
 }
 
-func decryptCryptexRTP(dst, ciphertext []byte, sameBuffer bool, header *rtp.Header, headerLen int,
+// decryptCryptexRTP unprotects a Cryptex packet. work is a scratch buffer that is disjoint from the
+// caller's original packet and already contains a copy of the authenticated portion (without MKI,
+// ROC or auth tag). All reordering, AEAD processing and profile rewriting happen on work, so a
+// failed verification leaves the caller's input packet untouched. On success the canonical plaintext
+// layout (CSRCs before the extension block) is written to dst.
+func decryptCryptexRTP(dst, work []byte, header *rtp.Header, headerLen int,
 	decrypt func(dst, ciphertext []byte, headerLen int) error,
 ) error {
-	moveHeaderExtensionBeforeCSRCs(header, ciphertext)
-	err := decrypt(dst, ciphertext, minSrtpHeaderSize+extensionHeaderSize)
-	if err != nil {
-		moveCSRCsBeforeHeaderExtension(header, ciphertext)
-
+	moveHeaderExtensionBeforeCSRCs(header, work)
+	if err := decrypt(work, work, minSrtpHeaderSize+extensionHeaderSize); err != nil {
 		return err
 	}
+	moveCSRCsBeforeHeaderExtension(header, work)
 
-	if !sameBuffer {
-		copy(dst, ciphertext[:minSrtpHeaderSize+extensionHeaderSize])
-		moveCSRCsBeforeHeaderExtension(header, dst)
+	if !isSameBuffer(dst, work) {
+		copy(dst, work)
 	}
-	moveCSRCsBeforeHeaderExtension(header, ciphertext)
 
 	// Update Header Extension Profile
 	offset := minSrtpHeaderSize + len(header.CSRC)*4

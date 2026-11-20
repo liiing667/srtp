@@ -82,10 +82,12 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 		}
 	}
 
-	err = c.checkCryptex(header)
-	if err != nil {
-		return nil, err
-	}
+	// The extension bits (X, profile, CC) are part of the unauthenticated RTP header.
+	// Record the wire-format Cryptex indication now, but do not select a processing
+	// branch or reject the packet based on it until the authentication tag has been
+	// verified below. Acting on it earlier lets an attacker trigger different code
+	// paths and error classes with a forged header.
+	isCryptex := isCryptexPacket(header)
 
 	cipher := c.cipher
 	if len(c.mkis) > 0 {
@@ -101,6 +103,12 @@ func (c *Context) decryptRTP(dst, ciphertext []byte, header *rtp.Header, headerL
 
 	dst, err = cipher.decryptRTP(dst, ciphertext, header, headerLen, roc, hasRocInPacket)
 	if err != nil {
+		return nil, err
+	}
+
+	// The packet authenticated successfully. It is now safe to enforce the Cryptex
+	// policy against the identity captured from the (now authenticated) wire header.
+	if err = c.checkCryptex(header.Extension, len(header.CSRC) > 0, isCryptex); err != nil {
 		return nil, err
 	}
 
@@ -196,14 +204,18 @@ func (c *Context) hasROCInPacket(header *rtp.Header, authTagLen int) (bool, int)
 	return hasRocInPacket, authTagLen
 }
 
-func (c *Context) checkCryptex(header *rtp.Header) error {
+// checkCryptex enforces the configured Cryptex policy. It MUST be called only after the SRTP
+// authentication tag has been verified, because the extension bits and CSRC count arrive in the
+// unauthenticated RTP header. isCryptex reports whether the authenticated wire header carries a
+// Cryptex extension profile (0xC0DE/0xC2DE); hasExtension and hasCSRC describe the same packet.
+func (c *Context) checkCryptex(hasExtension, hasCSRC, isCryptex bool) error {
 	switch c.cryptexMode {
 	case CryptexModeDisabled:
-		if isCryptexPacket(header) {
+		if isCryptex {
 			return errCryptexDisabled
 		}
 	case CryptexModeRequired:
-		if (header.Extension || len(header.CSRC) > 0) && !isCryptexPacket(header) {
+		if (hasExtension || hasCSRC) && !isCryptex {
 			return errUnencryptedHeaderExtAndCSRCs
 		}
 	default:

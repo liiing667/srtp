@@ -29,6 +29,10 @@ type srtpCipherAeadAesGcm struct {
 	rtpIV   [12]byte
 	rtcpIV  [12]byte
 	rtcpAAD [12]byte
+
+	// rtpScratch holds a private copy of an in-place Cryptex packet during decryption so that
+	// a failed authentication never mutates the caller-owned input buffer.
+	rtpScratch []byte
 }
 
 func (s *srtpCipherAeadAesGcm) setCryptex(useCryptex bool) {
@@ -201,53 +205,68 @@ func (s *srtpCipherAeadAesGcm) decryptRTP(
 		// Size of ciphertext is shorter than AEAD auth tag len.
 		return nil, ErrFailedToVerifyAuthTag
 	}
-	dst = growBufferSize(dst, nDst)
-	sameBuffer := isSameBuffer(dst, ciphertext)
-
 	nEnd := len(ciphertext) - len(s.mki) - rocLen
 
-	err = s.doDecryptRTP(dst, ciphertext, header, headerLen, roc, sameBuffer, nEnd, authTagLen)
+	// Grow to the full authenticated portion (nEnd); the returned slice is trimmed back to the
+	// plaintext length (nDst) after the tag has been verified.
+	dst = growBufferSize(dst, nEnd)
+	sameBuffer := isSameBuffer(dst, ciphertext)
+
+	// All AEAD processing happens on a buffer that (a) covers the full authenticated portion,
+	// including the auth tag, and (b) never aliases the caller's input packet. When dst is distinct
+	// from ciphertext it can serve directly; for in-place decryption use a private scratch copy so
+	// a failed verification (or a Cryptex reordering that precedes it) cannot mutate the input.
+	work := dst
+	if sameBuffer {
+		if cap(s.rtpScratch) < nEnd {
+			s.rtpScratch = make([]byte, nEnd)
+		}
+		work = s.rtpScratch[:nEnd]
+	}
+	copy(work, ciphertext[:nEnd])
+
+	err = s.doDecryptRTP(dst, work, header, headerLen, roc, authTagLen)
 	if err != nil {
 		return nil, err
 	}
 
-	return dst, nil
+	return dst[:nDst], nil
 }
 
-func (s *srtpCipherAeadAesGcm) doDecryptRTP(dst, ciphertext []byte, header *rtp.Header, headerLen int, roc uint32,
-	sameBuffer bool, nEnd int, authTagLen int,
+func (s *srtpCipherAeadAesGcm) doDecryptRTP(dst, work []byte, header *rtp.Header, headerLen int,
+	roc uint32, authTagLen int,
 ) error {
 	s.rtpInitializationVector(header, roc)
 	decrypt := func(dst, ciphertext []byte, headerLen int) error {
-		_, err := s.srtpCipher.Open(dst[headerLen:headerLen], s.rtpIV[:], ciphertext[headerLen:nEnd], ciphertext[:headerLen])
+		_, err := s.srtpCipher.Open(
+			dst[headerLen:headerLen], s.rtpIV[:], ciphertext[headerLen:], ciphertext[:headerLen],
+		)
 
 		return err
 	}
 
 	switch {
 	case isCryptexPacket(header):
-		err := decryptCryptexRTP(dst, ciphertext, sameBuffer, header, headerLen, decrypt)
+		err := decryptCryptexRTP(dst, work, header, headerLen, decrypt)
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrFailedToVerifyAuthTag, err)
 		}
 	case s.srtpEncrypted:
-		if err := decrypt(dst, ciphertext[:nEnd], headerLen); err != nil {
+		if err := decrypt(work, work, headerLen); err != nil {
 			return fmt.Errorf("%w: %w", ErrFailedToVerifyAuthTag, err)
 		}
-		// Copy the header unencrypted.
-		if !sameBuffer {
-			copy(dst[:headerLen], ciphertext[:headerLen])
+		// work may be a private scratch copy; write the verified plaintext into dst.
+		if !isSameBuffer(dst, work) {
+			copy(dst, work)
 		}
 	default:
-		nDataEnd := nEnd - authTagLen
-		if _, err := s.srtpCipher.Open(
-			nil, s.rtpIV[:], ciphertext[nDataEnd:nEnd], ciphertext[:nDataEnd],
-		); err != nil {
+		workDataEnd := len(work) - authTagLen
+		if _, err := s.srtpCipher.Open(nil, s.rtpIV[:], work[workDataEnd:], work[:workDataEnd]); err != nil {
 			return fmt.Errorf("%w: %w", ErrFailedToVerifyAuthTag, err)
 		}
-		// Copy the header and payload unencrypted.
-		if !sameBuffer {
-			copy(dst, ciphertext[:nDataEnd])
+		// work may be a private scratch copy; write the verified plaintext into dst.
+		if !isSameBuffer(dst, work) {
+			copy(dst, work[:workDataEnd])
 		}
 	}
 
